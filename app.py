@@ -1,148 +1,167 @@
-from flask import Flask, jsonify, request
-from dotenv import load_dotenv
 import os
+import io
 import base64
+import logging
+from flask import Flask, request, jsonify, make_response
+from flask_cors import CORS
+from dotenv import load_dotenv
+from PIL import Image
 import requests
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
 
-def create_app(config_object=None):
+# ---------- IMAGE RESIZE FUNCTION ----------
+def resize_image(raw_bytes, max_width=1024, quality=75):
+    """Resize image to reduce OpenAI tokens."""
+    try:
+        img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        w, h = img.size
+
+        # If already small, return as-is
+        if w <= max_width:
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=quality)
+            return out.getvalue()
+
+        scale = max_width / w
+        new_size = (int(w * scale), int(h * scale))
+
+        img = img.resize(new_size, Image.LANCZOS)
+
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=quality)
+        return out.getvalue()
+
+    except Exception as e:
+        logging.exception("Error resizing image")
+        raise e
+
+
+# ---------- CREATE FLASK APP ----------
+def create_app():
     app = Flask(__name__)
 
-    # Basic configuration
-    app.config.from_mapping(
-        SECRET_KEY=os.environ.get("SECRET_KEY", "dev_secret"),
-    )
+    # CORS for all routes (works with ngrok + Figma)
+    CORS(app, resources={r"/*": {"origins": "*"}})
 
-    # Simple routes
+    @app.after_request
+    def add_cors_headers(response):
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type,Authorization,X-Requested-With,Accept"
+        )
+        response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+        response.headers["Access-Control-Expose-Headers"] = "Content-Type,Authorization"
+        return response
+
+    @app.route("/<path:_any>", methods=["OPTIONS"])
+    @app.route("/", methods=["OPTIONS"])
+    def options_preflight(_any=None):
+        resp = make_response("", 200)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type,Authorization,X-Requested-With,Accept"
+        )
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+        return resp
+
     @app.route("/")
     def index():
-        return jsonify({"message": "Hello from Flask boilerplate!"})
+        return jsonify({"message": "Flask server is running"}), 200
 
-    @app.route("/test")
-    def test():
-        # get  text prompt from request
-        # send prompt to chatgpt api
-        # return response
-        return jsonify({"status": "ok"})
+    @app.route("/health")
+    def health():
+        return jsonify({"status": "ok"}), 200
 
+    # ---------- MAIN ENDPOINT ----------
     @app.route("/analyze-image", methods=["POST"])
     def analyze_image():
-        """
-        Accepts an image (base64 or URL) and returns an explanation from OpenAI Vision API.
-        Expected JSON body:
-        {
-            "image": "base64_encoded_image_or_url",
-            "prompt": "optional custom prompt (defaults to image explanation)",
-            "media_type": "image/jpeg"  # optional, defaults to jpeg
-        }
-        """
+        logging.info("=== HIT /analyze-image ===")
+
         try:
-            data = request.get_json(silent=True)
-            print("Received data:", data)
-            if not data or "image" not in data:
-                return jsonify({"error": "Missing 'image' field"}), 400
-
-            image_data = data.get("image")
-            custom_prompt = data.get(
-                "prompt",
-                "Explain what you see in this image in detail."
-            )
-            media_type = data.get("media_type", "image/jpeg")
-            openai_api_key = os.environ.get("OPENAI_API_KEY")
-
-            if not openai_api_key:
+            openai_key = os.environ.get("OPENAI_API_KEY")
+            if not openai_key:
                 return jsonify({"error": "OPENAI_API_KEY not configured"}), 500
 
-            # Prepare image content in CURRENT OpenAI chat format
-            if isinstance(image_data, str) and image_data.startswith("http"):
-                # URL-based image
-                image_content = {
-                    "type": "image_url",
-                    "image_url": {"url": image_data}
-                }
+            # -------- CASE 1: multipart upload --------
+            if "image" in request.files:
+                file = request.files["image"]
+                prompt = request.form.get("prompt", "Explain what you see in this image.")
+                raw = file.read()
+                logging.info(f"Received multipart image: {file.filename} ({len(raw)} bytes)")
+
+            # -------- CASE 2: JSON base64 upload --------
             else:
-                # Assume base64-encoded image (no data: prefix)
-                image_content = {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{media_type};base64,{image_data}"
-                    }
-                }
+                data = request.get_json(silent=True) or {}
+                if "image" not in data:
+                    return jsonify({"error": "Missing 'image'"}), 400
 
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {openai_api_key}"
-            }
+                b64 = data["image"]
+                prompt = data.get("prompt", "Explain what you see in this image.")
+                raw = base64.b64decode(b64)
+                logging.info(f"Received JSON base64 image ({len(raw)} bytes)")
 
+            # -------- RESIZE IMAGE (MASSIVE TOKEN REDUCTION) --------
+            raw_resized = resize_image(raw, max_width=1024, quality=75)
+            logging.info(f"Resized image size: {len(raw_resized)} bytes")
+
+            # Convert to base64 for OpenAI
+            final_b64 = base64.b64encode(raw_resized).decode("utf-8")
+            data_url = f"data:image/jpeg;base64,{final_b64}"
+
+            # -------- BUILD OPENAI API PAYLOAD --------
             payload = {
-                "model": "gpt-4o-mini",   # make sure ALL old gpt-4-vision refs are gone
+                "model": "gpt-4o-mini",
                 "messages": [
                     {
                         "role": "user",
                         "content": [
-                            {
-                                "type": "text",
-                                "text": custom_prompt
-                            },
-                            image_content
-                        ]
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
                     }
                 ],
-                "max_tokens": 512
+                "max_tokens": 512,
             }
-            print("DEBUG payload model:", payload["model"])
-            print("DEBUG payload:", payload)    
 
-            response = requests.post(
+            # -------- SEND TO OPENAI --------
+            resp = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 json=payload,
-                headers=headers,
-                timeout=30
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=60,
             )
 
-            if response.status_code != 200:
-                return jsonify({
-                    "error": f"OpenAI API error: {response.status_code}",
-                    "details": response.text
-                }), 500
+            if resp.status_code != 200:
+                logging.error(f"OpenAI error: {resp.text[:200]}")
+                return jsonify({"error": "OpenAI API error", "details": resp.text}), 500
 
-            result = response.json()
-            choices = result.get("choices")
-            if not choices or not isinstance(choices, list) or not choices[0].get("message"):
-                return jsonify({
-                    "error": "Unexpected response structure from OpenAI API",
-                    "details": result
-                }), 500
+            result = resp.json()
+            explanation = (
+                result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            )
 
-            explanation = choices[0]["message"].get("content", "")
-
-            return jsonify({
-                "explanation": explanation,
-                "model": result.get("model"),
-                "usage": result.get("usage")
-            })
+            return jsonify(
+                {
+                    "explanation": explanation,
+                    "model": result.get("model"),
+                    "usage": result.get("usage"),
+                }
+            )
 
         except Exception as e:
+            logging.exception("ERROR in /analyze-image")
             return jsonify({"error": str(e)}), 500
-
-
-    @app.route("/health")
-    def health():
-        return jsonify({"status": "ok"})
-
-    @app.route("/echo", methods=["POST"])
-    def echo():
-        """Echo endpoint: returns the posted JSON payload."""
-        data = request.get_json(silent=True)
-        return jsonify({"received": data}), 200
 
     return app
 
 
+# ---------- MAIN ----------
 if __name__ == "__main__":
     app = create_app()
-    port = int(os.environ.get("FLASK_RUN_PORT", 5000))
-    debug = os.environ.get("FLASK_DEBUG", "0") == "1" or os.environ.get("FLASK_ENV") == "development"
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    app.run(host="0.0.0.0", port=5000, debug=True)
